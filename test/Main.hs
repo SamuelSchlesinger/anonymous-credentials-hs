@@ -15,6 +15,7 @@ import Crypto.Sigma.Shake128 (Shake128Sponge)
 import Crypto.Sigma.Curve25519.Ristretto255
 
 import Crypto.AnonymousCredentials
+import qualified Crypto.AnonymousCredentials.CMZ as CMZ
 
 type G = Ristretto255Point
 type S = Ristretto255Scalar
@@ -22,8 +23,14 @@ type S = Ristretto255Scalar
 sponge :: Shake128Sponge
 sponge = makeIV "bbs-mac-test" "session-0"
 
+cmzSponge :: Shake128Sponge
+cmzSponge = makeIV "cmz-mac-test" "session-0"
+
 main :: IO ()
-main = defaultMain $ testGroup "BBS MAC" [macTests, presentationTests, prfTests, pseudonymTests]
+main = defaultMain $ testGroup "Anonymous Credentials"
+  [ testGroup "BBS MAC" [macTests, presentationTests, prfTests, pseudonymTests]
+  , testGroup "CMZ MAC" [cmzMacTests, cmzPresentationTests, cmzPseudonymTests]
+  ]
 
 ------------------------------------------------------------------------
 -- MAC tests
@@ -322,6 +329,276 @@ pseudonymTests = testGroup "Pseudonym Presentation"
       pres <- presentWithPseudonym @G @Shake128Sponge
                 sponge msgs mac (V.fromList [5,10,15]) 0 scope
       case verifyPseudonymPresentation @G @Shake128Sponge sponge sk 20 0 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "presentation should verify" ok
+  ]
+
+------------------------------------------------------------------------
+-- CMZ MAC tests
+------------------------------------------------------------------------
+
+cmzMacTests :: TestTree
+cmzMacTests = testGroup "MAC"
+  [ testCase "MAC verifies with correct messages" $ do
+      (sk, _pp) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      assertBool "MAC should verify" (CMZ.verifyMAC sk msgs mac)
+
+  , testCase "MAC rejects wrong messages" $ do
+      (sk, _pp) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      wrongMsgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      assertBool "MAC should not verify with wrong messages"
+        (not (CMZ.verifyMAC sk wrongMsgs mac))
+
+  , testCase "MAC rejects wrong key" $ do
+      (sk1, _pp1) <- CMZ.keygen @G 3
+      (sk2, _pp2) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk1 msgs
+      assertBool "MAC should not verify with wrong key"
+        (not (CMZ.verifyMAC sk2 msgs mac))
+
+  , testCase "MAC works with 0 attributes" $ do
+      (sk, _pp) <- CMZ.keygen @G 0
+      let msgs = V.empty
+      mac <- CMZ.cmzMAC sk msgs
+      assertBool "MAC should verify" (CMZ.verifyMAC sk msgs mac)
+
+  , testCase "MAC works with 1 attribute" $ do
+      (sk, _pp) <- CMZ.keygen @G 1
+      msgs <- V.replicateM 1 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      assertBool "MAC should verify" (CMZ.verifyMAC sk msgs mac)
+
+  , testCase "MAC works with 20 attributes" $ do
+      (sk, _pp) <- CMZ.keygen @G 20
+      msgs <- V.replicateM 20 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      assertBool "MAC should verify" (CMZ.verifyMAC sk msgs mac)
+  ]
+
+------------------------------------------------------------------------
+-- CMZ Presentation tests
+------------------------------------------------------------------------
+
+cmzPresentationTests :: TestTree
+cmzPresentationTests = testGroup "Presentation"
+  [ testCase "all messages hidden" $ do
+      (sk, pp) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac V.empty
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 3 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "presentation should verify" ok
+
+  , testCase "all messages disclosed" $ do
+      (sk, pp) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac (V.fromList [0,1,2])
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 3 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "presentation should verify" ok
+
+  , testCase "partial disclosure" $ do
+      (sk, pp) <- CMZ.keygen @G 5
+      msgs <- V.replicateM 5 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac (V.fromList [1,3])
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 5 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "presentation should verify" ok
+
+  , testCase "wrong secret key rejects" $ do
+      (sk1, pp1) <- CMZ.keygen @G 3
+      (sk2, _pp2) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk1 msgs
+      pres <- CMZ.present @G @Shake128Sponge cmzSponge pp1 msgs mac V.empty
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk2 pp1 3 pres of
+        Left _err -> pure ()
+        Right ok  -> assertBool "should reject with wrong key" (not ok)
+
+  , testCase "presentations are unlinkable (different randomizations)" $ do
+      (sk, pp) <- CMZ.keygen @G 2
+      msgs <- V.replicateM 2 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      pres1 <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac V.empty
+      pres2 <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac V.empty
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 2 pres1 of
+        Left err -> assertFailure ("pres1 deserialize error: " ++ show err)
+        Right ok -> assertBool "pres1 should verify" ok
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 2 pres2 of
+        Left err -> assertFailure ("pres2 deserialize error: " ++ show err)
+        Right ok -> assertBool "pres2 should verify" ok
+      assertBool "presentations should have different U"
+        (CMZ.presU pres1 /= CMZ.presU pres2)
+
+  , testCase "0 attributes, all hidden" $ do
+      (sk, pp) <- CMZ.keygen @G 0
+      let msgs = V.empty
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac V.empty
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 0 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "presentation should verify" ok
+
+  , testCase "20 attributes, partial disclosure" $ do
+      (sk, pp) <- CMZ.keygen @G 20
+      msgs <- V.replicateM 20 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.present @G @Shake128Sponge cmzSponge pp msgs mac
+                (V.fromList [0,5,10,15,19])
+      case CMZ.verifyPresentation @G @Shake128Sponge cmzSponge sk pp 20 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "presentation should verify" ok
+
+  , testCase "wrong sponge session rejects" $ do
+      let sponge1 = makeIV @Shake128Sponge "cmz-mac-test" "session-A"
+          sponge2 = makeIV @Shake128Sponge "cmz-mac-test" "session-B"
+      (sk, pp) <- CMZ.keygen @G 3
+      msgs <- V.replicateM 3 (scalarRandom @S)
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.present @G @Shake128Sponge sponge1 pp msgs mac V.empty
+      case CMZ.verifyPresentation @G @Shake128Sponge sponge2 sk pp 3 pres of
+        Left _err -> pure ()
+        Right ok  -> assertBool "should reject with wrong session" (not ok)
+  ]
+
+------------------------------------------------------------------------
+-- CMZ Pseudonym presentation tests
+------------------------------------------------------------------------
+
+cmzPseudonymTests :: TestTree
+cmzPseudonymTests = testGroup "Pseudonym Presentation"
+  [ testCase "pseudonym presentation verifies (all hidden)" $ do
+      (sk, pp) <- CMZ.keygen @G 3
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      m2 <- scalarRandom @S
+      scope <- scalarRandom @S
+      let msgs = V.fromList [k, m1, m2]
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                cmzSponge pp msgs mac V.empty 0 scope
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk pp 3 0 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "pseudonym presentation should verify" ok
+
+  , testCase "pseudonym presentation verifies (partial disclosure)" $ do
+      (sk, pp) <- CMZ.keygen @G 4
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      m2 <- scalarRandom @S
+      m3 <- scalarRandom @S
+      scope <- scalarRandom @S
+      let msgs = V.fromList [m1, m2, k, m3]
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                cmzSponge pp msgs mac (V.fromList [0, 3]) 2 scope
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk pp 4 2 pres of
+        Left err -> assertFailure ("deserialize error: " ++ show err)
+        Right ok -> assertBool "pseudonym presentation should verify" ok
+
+  , testCase "pseudonym matches standalone PRF evaluation" $ do
+      (sk, pp) <- CMZ.keygen @G 2
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      scope <- scalarRandom @S
+      let msgs = V.fromList [k, m1]
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                cmzSponge pp msgs mac V.empty 0 scope
+      let expected = dyPRF @G k scope
+      assertBool "pseudonym should match direct PRF evaluation"
+        (CMZ.ppPseudonym pres == expected)
+
+  , testCase "same key and scope produce same pseudonym across presentations" $ do
+      (sk, pp) <- CMZ.keygen @G 2
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      scope <- scalarRandom @S
+      let msgs = V.fromList [k, m1]
+      mac <- CMZ.cmzMAC sk msgs
+      pres1 <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                 cmzSponge pp msgs mac V.empty 0 scope
+      pres2 <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                 cmzSponge pp msgs mac V.empty 0 scope
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk pp 2 0 pres1 of
+        Left err -> assertFailure ("pres1 error: " ++ show err)
+        Right ok -> assertBool "pres1 should verify" ok
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk pp 2 0 pres2 of
+        Left err -> assertFailure ("pres2 error: " ++ show err)
+        Right ok -> assertBool "pres2 should verify" ok
+      assertBool "pseudonyms should match"
+        (CMZ.ppPseudonym pres1 == CMZ.ppPseudonym pres2)
+      assertBool "U should differ"
+        (CMZ.ppU pres1 /= CMZ.ppU pres2)
+
+  , testCase "different scopes produce different pseudonyms" $ do
+      (sk, pp) <- CMZ.keygen @G 2
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      scope1 <- scalarRandom @S
+      scope2 <- scalarRandom @S
+      let msgs = V.fromList [k, m1]
+      mac <- CMZ.cmzMAC sk msgs
+      pres1 <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                 cmzSponge pp msgs mac V.empty 0 scope1
+      pres2 <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                 cmzSponge pp msgs mac V.empty 0 scope2
+      assertBool "different scopes should give different pseudonyms"
+        (CMZ.ppPseudonym pres1 /= CMZ.ppPseudonym pres2)
+
+  , testCase "wrong secret key rejects pseudonym presentation" $ do
+      (sk1, pp1) <- CMZ.keygen @G 2
+      (sk2, _pp2) <- CMZ.keygen @G 2
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      scope <- scalarRandom @S
+      let msgs = V.fromList [k, m1]
+      mac <- CMZ.cmzMAC sk1 msgs
+      pres <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                cmzSponge pp1 msgs mac V.empty 0 scope
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk2 pp1 2 0 pres of
+        Left _   -> pure ()
+        Right ok -> assertBool "should reject wrong key" (not ok)
+
+  , testCase "wrong PRF key index rejects" $ do
+      (sk, pp) <- CMZ.keygen @G 3
+      k <- scalarRandom @S
+      m1 <- scalarRandom @S
+      m2 <- scalarRandom @S
+      scope <- scalarRandom @S
+      let msgs = V.fromList [k, m1, m2]
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                cmzSponge pp msgs mac V.empty 0 scope
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk pp 3 1 pres of
+        Left _   -> pure ()
+        Right ok -> assertBool "should reject wrong PRF key index" (not ok)
+
+  , testCase "20 attributes with pseudonym" $ do
+      (sk, pp) <- CMZ.keygen @G 20
+      k <- scalarRandom @S
+      otherMsgs <- V.replicateM 19 (scalarRandom @S)
+      scope <- scalarRandom @S
+      let msgs = V.cons k otherMsgs
+      mac <- CMZ.cmzMAC sk msgs
+      pres <- CMZ.presentWithPseudonym @G @Shake128Sponge
+                cmzSponge pp msgs mac (V.fromList [5,10,15]) 0 scope
+      case CMZ.verifyPseudonymPresentation @G @Shake128Sponge
+             cmzSponge sk pp 20 0 pres of
         Left err -> assertFailure ("deserialize error: " ++ show err)
         Right ok -> assertBool "presentation should verify" ok
   ]
