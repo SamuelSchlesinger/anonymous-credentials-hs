@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -175,7 +176,7 @@ verifyMAC (SecretKey sk) msgs (MAC u uPrime uBases) =
      u /= groupIdentity
   && V.length uBases == V.length sk
   && V.length msgs == V.length sk - 1
-  && V.and (V.zipWith (\x_j u_j -> u_j == groupScalarMul u x_j) sk uBases)
+  && allBasesMatch u sk uBases
   && uPrime == expected
   where
     expected = V.ifoldl'
@@ -270,7 +271,7 @@ verifyPresentation sponge (SecretKey sk) numAttrs pres =
     then Right False
   else if V.length rUBases /= V.length sk
     then Right False
-  else if not (V.and (V.zipWith (\x_j u_j -> u_j == groupScalarMul rU x_j) sk rUBases))
+  else if not (allBasesMatch rU sk rUBases)
     then Right False
   else
     let discSet = V.toList (V.map fst disclosed)
@@ -366,7 +367,7 @@ verifyPseudonymPresentation sponge (SecretKey sk) numAttrs prfKeyIdx pres =
     then Right False
   else if V.length rUBases /= V.length sk
     then Right False
-  else if not (V.and (V.zipWith (\x_j u_j -> u_j == groupScalarMul rU x_j) sk rUBases))
+  else if not (allBasesMatch rU sk rUBases)
     then Right False
   else
     let discSet = V.toList (V.map fst disclosed)
@@ -376,6 +377,19 @@ verifyPseudonymPresentation sponge (SecretKey sk) numAttrs prfKeyIdx pres =
         sponge' = absorbPseudonymPresentation @g
                     sponge rU rUPrime rUBases disclosed pseudonym scope
     in verify sponge' (newSchnorrProof relation) (ppProof pres)
+
+------------------------------------------------------------------------
+-- Internal: constant-time helpers
+------------------------------------------------------------------------
+
+-- | Check that every base matches the secret key, in constant time.
+-- Forces all comparisons regardless of earlier results to prevent
+-- timing leaks that reveal which key index failed.
+allBasesMatch :: Group g => g -> V.Vector (GroupScalar g) -> V.Vector g -> Bool
+allBasesMatch u sk uBases =
+  V.foldl' (\acc (x_j, u_j) ->
+    let !eq = u_j == groupScalarMul u x_j
+    in acc && eq) True (V.zip sk uBases)
 
 ------------------------------------------------------------------------
 -- Internal: proof image computation
