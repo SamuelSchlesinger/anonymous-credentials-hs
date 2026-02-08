@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -239,7 +238,7 @@ present sponge pp msgs (MAC u uPrime) disclosedIdxs = do
       witness = hiddenMsgs V.++ zs V.++ V.singleton negR
 
   let relation = buildCMZRelation uHat h commits xis vVal hidden
-      sponge'  = absorbCMZPresentation @g sponge uHat uPrimeCommit commits disclosed
+      sponge'  = absorbCMZPresentation @g sponge pp uHat uPrimeCommit commits disclosed
 
   proofBytes <- prove sponge' (newSchnorrProof relation) witness
   pure Presentation
@@ -267,13 +266,17 @@ verifyPresentation sponge (SecretKey sk) pp numAttrs pres =
       h            = cmzH pp
       xis          = cmzXi pp
   in
+  let discSet = V.toList (V.map fst disclosed)
+      hidden  = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
+  in
   if uHat == groupIdentity
     then Right False
+  else if V.length commits /= V.length hidden
+    then Right False
+  else if V.any (\(dj, _) -> dj < 0 || dj >= numAttrs) disclosed
+    then Right False
   else
-    let discSet = V.toList (V.map fst disclosed)
-        hidden  = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
-
-        -- V = x_0 * U_hat + sum(x_{h_i} * commit_i)
+    let -- V = x_0 * U_hat + sum(x_{h_i} * commit_i)
         --   + sum(x_{d_j} * m_j * U_hat) - UPrimeCommit
         vVal = groupScalarMul uHat (V.head sk)
              |+| V.ifoldl' (\acc j hIdx ->
@@ -285,7 +288,7 @@ verifyPresentation sponge (SecretKey sk) pp numAttrs pres =
              |-| uPrimeCommit
 
         relation = buildCMZRelation uHat h commits xis vVal hidden
-        sponge'  = absorbCMZPresentation @g sponge uHat uPrimeCommit commits disclosed
+        sponge'  = absorbCMZPresentation @g sponge pp uHat uPrimeCommit commits disclosed
     in verify sponge' (newSchnorrProof relation) (presProof pres)
 
 ------------------------------------------------------------------------
@@ -349,7 +352,7 @@ presentWithPseudonym sponge pp msgs (MAC u uPrime) disclosedIdxs prfKeyIdx scope
   let relation = buildCMZCombinedRelation uHat h commits xis vVal hidden
                    pseudonym scope prfKeyIdx
       sponge'  = absorbCMZPseudonymPresentation @g
-                   sponge uHat uPrimeCommit commits disclosed pseudonym scope
+                   sponge pp uHat uPrimeCommit commits disclosed pseudonym scope
 
   proofBytes <- prove sponge' (newSchnorrProof relation) witness
   pure PseudonymPresentation
@@ -383,15 +386,19 @@ verifyPseudonymPresentation sponge (SecretKey sk) pp numAttrs prfKeyIdx pres =
       h            = cmzH pp
       xis          = cmzXi pp
   in
+  let discSet = V.toList (V.map fst disclosed)
+      hidden  = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
+  in
   if uHat == groupIdentity
     then Right False
   else if pseudonym == groupIdentity
     then Right False
+  else if V.length commits /= V.length hidden
+    then Right False
+  else if V.any (\(dj, _) -> dj < 0 || dj >= numAttrs) disclosed
+    then Right False
   else
-    let discSet = V.toList (V.map fst disclosed)
-        hidden  = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
-
-        vVal = groupScalarMul uHat (V.head sk)
+    let vVal = groupScalarMul uHat (V.head sk)
              |+| V.ifoldl' (\acc j hIdx ->
                    acc |+| groupScalarMul (commits V.! j) (sk V.! (hIdx + 1)))
                  groupIdentity hidden
@@ -403,7 +410,7 @@ verifyPseudonymPresentation sponge (SecretKey sk) pp numAttrs prfKeyIdx pres =
         relation = buildCMZCombinedRelation uHat h commits xis vVal hidden
                      pseudonym scope prfKeyIdx
         sponge'  = absorbCMZPseudonymPresentation @g
-                     sponge uHat uPrimeCommit commits disclosed pseudonym scope
+                     sponge pp uHat uPrimeCommit commits disclosed pseudonym scope
     in verify sponge' (newSchnorrProof relation) (ppProof pres)
 
 ------------------------------------------------------------------------
@@ -538,35 +545,44 @@ buildCMZCombinedRelation uHat h commits xis vVal hidden
 ------------------------------------------------------------------------
 
 -- | Absorb CMZ presentation context into a Fiat-Shamir sponge.
+--
+-- Absorbs the public parameters @H@ and all @X_i@ for domain separation,
+-- followed by the presentation-specific values.
 absorbCMZPresentation :: forall g sponge.
                          (Group g, DuplexSponge sponge, Unit sponge ~ Word8)
-                      => sponge -> g -> g -> V.Vector g
+                      => sponge -> PublicParams g -> g -> g -> V.Vector g
                       -> V.Vector (Int, GroupScalar g) -> sponge
-absorbCMZPresentation s0 uHat uPrimeCommit commits disclosed =
-  let s1 = absorbDuplexSponge s0 (BS.unpack $ serializeElement uHat)
-      s2 = absorbDuplexSponge s1 (BS.unpack $ serializeElement uPrimeCommit)
-      s3 = V.foldl'
+absorbCMZPresentation s0 pp uHat uPrimeCommit commits disclosed =
+  let -- Absorb public parameters for domain separation
+      s1 = absorbDuplexSponge s0 (BS.unpack $ serializeElement (cmzH pp))
+      s2 = V.foldl'
+             (\s xi -> absorbDuplexSponge s (BS.unpack $ serializeElement xi))
+             s1 (cmzXi pp)
+      -- Absorb presentation values
+      s3 = absorbDuplexSponge s2 (BS.unpack $ serializeElement uHat)
+      s4 = absorbDuplexSponge s3 (BS.unpack $ serializeElement uPrimeCommit)
+      s5 = V.foldl'
              (\s c -> absorbDuplexSponge s (BS.unpack $ serializeElement c))
-             s2 commits
+             s4 commits
       sorted = sortBy (comparing fst) (V.toList disclosed)
-      s4 = absorbDuplexSponge s3 (BS.unpack $ i2osp 4 (length sorted))
-      s5 = foldl
+      s6 = absorbDuplexSponge s5 (BS.unpack $ i2osp 4 (length sorted))
+      s7 = foldl
              (\s (i, m) ->
                absorbDuplexSponge
                  (absorbDuplexSponge s (BS.unpack $ i2osp 4 i))
                  (BS.unpack $ serializeScalar m))
-             s4 sorted
-  in s5
+             s6 sorted
+  in s7
 
 -- | Absorb CMZ pseudonym presentation context.
 absorbCMZPseudonymPresentation :: forall g sponge.
                                   ( Group g, DuplexSponge sponge
                                   , Unit sponge ~ Word8 )
-                               => sponge -> g -> g -> V.Vector g
+                               => sponge -> PublicParams g -> g -> g -> V.Vector g
                                -> V.Vector (Int, GroupScalar g)
                                -> g -> GroupScalar g -> sponge
-absorbCMZPseudonymPresentation s0 uHat uPrimeCommit commits disclosed pseudonym scope =
-  let s1 = absorbCMZPresentation @g s0 uHat uPrimeCommit commits disclosed
+absorbCMZPseudonymPresentation s0 pp uHat uPrimeCommit commits disclosed pseudonym scope =
+  let s1 = absorbCMZPresentation @g s0 pp uHat uPrimeCommit commits disclosed
       s2 = absorbDuplexSponge s1 (BS.unpack $ serializeElement pseudonym)
       s3 = absorbDuplexSponge s2 (BS.unpack $ serializeScalar scope)
   in s3
