@@ -4,8 +4,11 @@
 -- Re-exports BBS MAC and Dodis-Yampolskiy PRF for backwards compatibility.
 -- For the CMZ MAC_GGM scheme, use "Crypto.AnonymousCredentials.CMZ".
 module Crypto.AnonymousCredentials
-  ( -- * Secret Key
-    SecretKey(..)
+  ( -- * System Parameters
+    SystemParams(..)
+  , setupParams
+    -- * Secret Key
+  , SecretKey(..)
   , keygen
     -- * MAC
   , MAC(..)

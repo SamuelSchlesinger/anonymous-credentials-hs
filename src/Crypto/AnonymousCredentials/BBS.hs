@@ -11,19 +11,16 @@
 --
 -- __This library has not been independently audited. Use at your own risk.__
 --
--- BBS MAC (algebraic MAC) and keyed-verification anonymous credential
--- presentation, based on the construction from "Algebraic MACs and
--- Keyed-Verification Anonymous Credentials" (Chase, Meiklejohn, Zaverucha,
--- CCS 2014).
+-- BBS MAC and keyed-verification anonymous credential presentation,
+-- based on Section 3.1 of the Range.pdf construction.
 --
--- The MAC is computed over a prime-order group without pairings. Each MAC
--- includes auxiliary base points derived from the secret key, which allow
--- the credential holder to construct zero-knowledge proofs of knowledge
--- of hidden attributes using sigma protocols.
+-- A BBS MAC on messages @(m_1, ..., m_L)@ is a pair @(A, e)@ where
+-- @A = (g + Σ h_i * m_i) ^ {1/(e+x)}@ for secret key @x@ and system-wide
+-- public generators @h_1, ..., h_L@.
 --
 -- The presentation protocol provides:
 --
--- * __Unlinkability__: each presentation is randomized with a fresh scalar,
+-- * __Unlinkability__: each presentation is randomized with fresh scalars,
 --   so different presentations of the same credential are unlinkable.
 --
 -- * __Selective disclosure__: the holder can reveal a subset of attributes
@@ -33,13 +30,16 @@
 -- * __Scoped pseudonyms__: via the Dodis-Yampolskiy PRF, a credential
 --   attribute can serve as a PRF key that produces a unique, deterministic
 --   pseudonym per scope label. The proof binds the pseudonym to the
---   credential by sharing the PRF key witness across both the MAC and
---   PRF equations.
+--   credential by sharing the PRF key witness across both the MAC
+--   and PRF equations.
 --
 -- Verification is keyed: the verifier must hold the secret key.
 module Crypto.AnonymousCredentials.BBS
-  ( -- * Secret Key
-    SecretKey(..)
+  ( -- * System Parameters
+    SystemParams(..)
+  , setupParams
+    -- * Secret Key
+  , SecretKey(..)
   , keygen
     -- * MAC
   , MAC(..)
@@ -77,43 +77,36 @@ import Crypto.AnonymousCredentials.Internal (dyPRF)
 -- Types
 ------------------------------------------------------------------------
 
--- | Secret key for BBS MAC supporting @L@ attributes.
+-- | System-wide public generators @h_1, ..., h_L@ for @L@ attributes.
 --
--- Contains @L + 1@ scalars: @x_0@ (base key) and @x_1, ..., x_L@
--- (per-attribute keys).
-newtype SecretKey g = SecretKey
-  { skScalars :: V.Vector (GroupScalar g) }
+-- These are random group elements with unknown discrete log relationships.
+newtype SystemParams g = SystemParams
+  { spGenerators :: V.Vector g }
 
--- | BBS MAC on a vector of messages.
+-- | Secret key: a single scalar @x@.
+newtype SecretKey g = SecretKey
+  { skScalar :: GroupScalar g }
+
+-- | BBS MAC @(A, e)@ on a vector of messages.
 --
--- The MAC consists of:
---
--- * A random base point @u@
--- * The MAC value @u' = u_0 + Σ_{i=0}^{L-1} m_i * u_{i+1}@
--- * Auxiliary base points @u_j = x_j * u@ for @j = 0, ..., L@
---
--- The auxiliary bases enable the credential holder to construct
--- zero-knowledge proofs of knowledge of hidden attributes.
+-- Satisfies @A^{e+x} = g + Σ h_i * m_i@ (the "body" @B@).
 data MAC g = MAC
-  { macU      :: g
-  , macUPrime :: g
-  , macUBases :: V.Vector g
+  { macA :: g
+  , macE :: GroupScalar g
   }
 
 -- | A credential presentation with selective disclosure.
 --
--- Contains a randomized MAC, disclosed attribute values, and a
--- Fiat-Shamir proof of knowledge of the hidden attributes.
+-- Contains randomized MAC components and a Fiat-Shamir proof of
+-- knowledge of the hidden attributes plus the MAC exponent.
 data Presentation g = Presentation
-  { presU         :: g
-  -- ^ Randomized base point @U = r * u@
-  , presUPrime    :: g
-  -- ^ Randomized MAC value @U' = r * u'@
-  , presUBases    :: V.Vector g
-  -- ^ Randomized bases @U_j = r * u_j@ for @j = 0, ..., L@
+  { presAPrime   :: g
+  -- ^ @A' = A^{r1 * r2}@
+  , presBBar     :: g
+  -- ^ @Bbar = B^{r1}@
   , presDisclosed :: V.Vector (Int, GroupScalar g)
   -- ^ @(index, message)@ pairs for disclosed attributes (0-based indices)
-  , presProof     :: ByteString
+  , presProof    :: ByteString
   -- ^ Compact Fiat-Shamir proof of knowledge of hidden attributes
   }
 
@@ -121,15 +114,12 @@ data Presentation g = Presentation
 --
 -- In addition to selective disclosure, the holder proves correct
 -- evaluation of the Dodis-Yampolskiy PRF using a credential attribute
--- as the PRF key. The pseudonym is deterministic per (key, scope) pair
--- but unlinkable across different scopes.
+-- as the PRF key.
 data PseudonymPresentation g = PseudonymPresentation
-  { ppU         :: g
-  -- ^ Randomized base point @U = r * u@
-  , ppUPrime    :: g
-  -- ^ Randomized MAC value @U' = r * u'@
-  , ppUBases    :: V.Vector g
-  -- ^ Randomized bases @U_j = r * u_j@ for @j = 0, ..., L@
+  { ppAPrime    :: g
+  -- ^ @A' = A^{r1 * r2}@
+  , ppBBar      :: g
+  -- ^ @Bbar = B^{r1}@
   , ppDisclosed :: V.Vector (Int, GroupScalar g)
   -- ^ @(index, message)@ pairs for disclosed attributes (0-based indices)
   , ppPseudonym :: g
@@ -137,130 +127,140 @@ data PseudonymPresentation g = PseudonymPresentation
   , ppScope     :: GroupScalar g
   -- ^ The scope label used to derive the pseudonym
   , ppProof     :: ByteString
-  -- ^ Compact Fiat-Shamir proof of knowledge of hidden attributes
-  -- and correct PRF evaluation
+  -- ^ Compact Fiat-Shamir proof
   }
 
 ------------------------------------------------------------------------
--- Key generation and MAC
+-- Setup, key generation, and MAC
 ------------------------------------------------------------------------
 
--- | Generate a secret key for @numAttrs@-attribute MACs.
-keygen :: forall g m. (Group g, MonadRandom m) => Int -> m (SecretKey g)
-keygen numAttrs = SecretKey <$> V.replicateM (numAttrs + 1) scalarRandom
+-- | Generate @L@ random public generators for a system supporting
+-- @L@ attributes.
+setupParams :: forall g m. (Group g, MonadRandom m) => Int -> m (SystemParams g)
+setupParams numAttrs = SystemParams <$> V.replicateM numAttrs groupRandom
 
--- | Compute a BBS MAC on a vector of messages.
+-- | Generate a secret key (a single random scalar @x@).
+keygen :: forall g m. (Group g, MonadRandom m) => m (SecretKey g)
+keygen = SecretKey <$> scalarRandom
+
+-- | Compute a BBS MAC on a vector of messages, producing @(A, e)@.
 --
--- The messages vector must have exactly @L@ elements, matching the number
--- of attributes the secret key was generated for.
+-- Computes @B = g + Σ h_i * m_i@, chooses random @e@, and sets
+-- @A = B^{1/(e+x)}@.
 bbsMAC :: forall g m. (Group g, MonadRandom m)
-       => SecretKey g
+       => SystemParams g
+       -> SecretKey g
        -> V.Vector (GroupScalar g)
        -> m (MAC g)
-bbsMAC (SecretKey sk) msgs = do
-  u <- groupRandom
-  let uBases = V.map (groupScalarMul u) sk
-      uPrime = V.ifoldl'
-        (\acc i m_i -> acc |+| groupScalarMul (uBases V.! (i + 1)) m_i)
-        (V.head uBases)
-        msgs
-  pure (MAC u uPrime uBases)
+bbsMAC (SystemParams hs) (SecretKey x) msgs = do
+  e <- scalarRandom
+  let b = computeB hs msgs
+      a = b |*| scalarInvert (e .+. x)
+  pure (MAC a e)
 
 -- | Verify a BBS MAC using the secret key.
+--
+-- Checks @A^{e+x} == g + Σ h_i * m_i@.
+-- Verification is keyed (requires the secret key).
 verifyMAC :: forall g. Group g
-          => SecretKey g
+          => SystemParams g
+          -> SecretKey g
           -> V.Vector (GroupScalar g)
           -> MAC g
           -> Bool
-verifyMAC (SecretKey sk) msgs (MAC u uPrime uBases) =
-     u /= groupIdentity
-  && V.length uBases == V.length sk
-  && V.length msgs == V.length sk - 1
-  && allBasesMatch u sk uBases
-  && uPrime == expected
-  where
-    expected = V.ifoldl'
-      (\acc i m_i -> acc |+| groupScalarMul (uBases V.! (i + 1)) m_i)
-      (V.head uBases)
-      msgs
+verifyMAC (SystemParams hs) (SecretKey x) msgs (MAC a e) =
+     a /= groupIdentity
+  && groupScalarMul a (e .+. x) == computeB hs msgs
 
 ------------------------------------------------------------------------
 -- Presentation (without pseudonym)
 ------------------------------------------------------------------------
 
--- | Create a presentation proving knowledge of a valid MAC with selective
--- disclosure.
+-- | Create a presentation proving knowledge of a valid BBS MAC
+-- with selective disclosure.
 --
--- The holder randomizes the MAC and produces a zero-knowledge proof that
--- they know the hidden attributes. The sponge parameter should be
--- initialized with appropriate protocol and session identifiers for domain
--- separation (e.g. via 'Crypto.Sigma.FiatShamir.makeIV').
+-- The prover randomizes the MAC and produces a zero-knowledge
+-- proof that they know the hidden attributes and the MAC exponent.
+--
+-- The sponge parameter should be initialized with appropriate protocol
+-- and session identifiers for domain separation.
 --
 -- @disclosedIdxs@ contains 0-based indices of attributes to reveal.
 present :: forall g sponge m.
            (Group g, DuplexSponge sponge, Unit sponge ~ Word8, MonadRandom m)
         => sponge
+        -> SystemParams g
         -> V.Vector (GroupScalar g)
         -> MAC g
         -> V.Vector Int
         -> m (Presentation g)
-present sponge msgs (MAC u uPrime uBases) disclosedIdxs = do
-  r <- scalarRandom
-  let rU      = groupScalarMul u r
-      rUPrime = groupScalarMul uPrime r
-      rUBases = V.map (\b -> groupScalarMul b r) uBases
+present sponge (SystemParams hs) msgs (MAC a e) disclosedIdxs = do
+  r1 <- scalarRandom
+  r2 <- scalarRandom
+  let b      = computeB hs msgs
+      aPrime = groupScalarMul a (r1 .*. r2)
+      bBar   = groupScalarMul b r1
+      r3     = scalarInvert r1
 
       numAttrs = V.length msgs
       discSet  = V.toList disclosedIdxs
       hidden   = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
       disclosed = V.map (\i -> (i, msgs V.! i)) disclosedIdxs
-      hiddenMsgs = V.map (\i -> msgs V.! i) hidden
 
-      v = computeV rUPrime rUBases disclosed
-      relation = buildMACRelation rUBases v hidden
-      sponge' = absorbPresentation @g sponge rU rUPrime rUBases disclosed
+      -- Abar = A'^{-e} + Bbar^{r2} = A'^x (without knowing x)
+      aBar = groupScalarMul aPrime (scalarNeg e)
+               |+| groupScalarMul bBar r2
 
-  proofBytes <- prove sponge' (newSchnorrProof relation) hiddenMsgs
+      -- H_1 = g + sum_{i in D} h_i * m_i
+      h1 = V.foldl' (\acc (i, m_i) -> acc |+| groupScalarMul (hs V.! i) m_i)
+             groupGenerator disclosed
+
+      -- Witness: [negE, r2, r3, negM_{h_0}, ..., negM_{h_{k-1}}]
+      negE = scalarNeg e
+      hiddenNegMsgs = V.map (\i -> scalarNeg (msgs V.! i)) hidden
+      witness = V.fromList [negE, r2, r3] V.++ hiddenNegMsgs
+
+      relation = buildBBSRelation aPrime bBar aBar h1 hs hidden
+      sponge'  = absorbPresentation @g sponge hs aPrime bBar disclosed
+
+  proofBytes <- prove sponge' (newSchnorrProof relation) witness
   pure Presentation
-    { presU         = rU
-    , presUPrime    = rUPrime
-    , presUBases    = rUBases
+    { presAPrime   = aPrime
+    , presBBar     = bBar
     , presDisclosed = disclosed
-    , presProof     = proofBytes
+    , presProof    = proofBytes
     }
 
 -- | Verify a credential presentation using the secret key.
 --
--- Checks that:
---
--- 1. The randomized base point is not the identity.
--- 2. Each randomized base @U_j@ equals @x_j * U@ (key consistency).
--- 3. The Fiat-Shamir proof of knowledge of hidden attributes verifies.
+-- The verifier computes @Abar = x * A'@ and checks the proof.
 verifyPresentation :: forall g sponge.
                       (Group g, DuplexSponge sponge, Unit sponge ~ Word8)
                    => sponge
+                   -> SystemParams g
                    -> SecretKey g
                    -> Int
                    -> Presentation g
                    -> Either DeserializeError Bool
-verifyPresentation sponge (SecretKey sk) numAttrs pres =
-  let rU       = presU pres
-      rUPrime  = presUPrime pres
-      rUBases  = presUBases pres
+verifyPresentation sponge (SystemParams hs) (SecretKey x) numAttrs pres =
+  let aPrime   = presAPrime pres
+      bBar     = presBBar pres
       disclosed = presDisclosed pres
   in
-  if rU == groupIdentity
-    then Right False
-  else if V.length rUBases /= V.length sk
-    then Right False
-  else if not (allBasesMatch rU sk rUBases)
+  if aPrime == groupIdentity
     then Right False
   else
-    let discSet = V.toList (V.map fst disclosed)
+    let aBar = groupScalarMul aPrime x
+
+        discSet = V.toList (V.map fst disclosed)
         hidden  = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
-        v = computeV rUPrime rUBases disclosed
-        relation = buildMACRelation rUBases v hidden
-        sponge' = absorbPresentation @g sponge rU rUPrime rUBases disclosed
+
+        -- H_1 = g + sum_{i in D} h_i * m_i
+        h1 = V.foldl' (\acc (i, m_i) -> acc |+| groupScalarMul (hs V.! i) m_i)
+               groupGenerator disclosed
+
+        relation = buildBBSRelation aPrime bBar aBar h1 hs hidden
+        sponge'  = absorbPresentation @g sponge hs aPrime bBar disclosed
     in verify sponge' (newSchnorrProof relation) (presProof pres)
 
 ------------------------------------------------------------------------
@@ -273,46 +273,58 @@ verifyPresentation sponge (SecretKey sk) numAttrs pres =
 -- Dodis-Yampolskiy PRF key. The pseudonym @P = (1 / (k + scope)) * G@ is
 -- computed and a combined sigma protocol proof demonstrates both:
 --
--- 1. Knowledge of a valid MAC (hidden attributes)
--- 2. Correct PRF evaluation: @(k + scope) * P = G@, binding the pseudonym
---    to the same key @k@ in the credential.
+-- 1. Knowledge of a valid BBS MAC (hidden attributes)
+-- 2. Correct PRF evaluation: binding the pseudonym to the same key @k@
+--    in the credential.
 --
 -- The PRF key attribute must NOT appear in @disclosedIdxs@.
 presentWithPseudonym :: forall g sponge m.
                         ( Group g, DuplexSponge sponge
                         , Unit sponge ~ Word8, MonadRandom m )
                      => sponge
+                     -> SystemParams g
                      -> V.Vector (GroupScalar g)
                      -> MAC g
                      -> V.Vector Int
                      -> Int
                      -> GroupScalar g
                      -> m (PseudonymPresentation g)
-presentWithPseudonym sponge msgs (MAC u uPrime uBases) disclosedIdxs prfKeyIdx scope = do
-  r <- scalarRandom
-  let rU      = groupScalarMul u r
-      rUPrime = groupScalarMul uPrime r
-      rUBases = V.map (\b -> groupScalarMul b r) uBases
+presentWithPseudonym sponge (SystemParams hs) msgs (MAC a e)
+                     disclosedIdxs prfKeyIdx scope = do
+  r1 <- scalarRandom
+  r2 <- scalarRandom
+  let b      = computeB hs msgs
+      aPrime = groupScalarMul a (r1 .*. r2)
+      bBar   = groupScalarMul b r1
+      r3     = scalarInvert r1
 
       numAttrs = V.length msgs
       discSet  = V.toList disclosedIdxs
       hidden   = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
       disclosed = V.map (\i -> (i, msgs V.! i)) disclosedIdxs
-      hiddenMsgs = V.map (\i -> msgs V.! i) hidden
+
+      aBar = groupScalarMul aPrime (scalarNeg e)
+               |+| groupScalarMul bBar r2
+
+      h1 = V.foldl' (\acc (i, m_i) -> acc |+| groupScalarMul (hs V.! i) m_i)
+             groupGenerator disclosed
 
       k = msgs V.! prfKeyIdx
       pseudonym = dyPRF @g k scope
 
-      v = computeV rUPrime rUBases disclosed
-      relation = buildCombinedRelation rUBases v hidden pseudonym scope prfKeyIdx
-      sponge' = absorbPseudonymPresentation @g
-                  sponge rU rUPrime rUBases disclosed pseudonym scope
+      negE = scalarNeg e
+      hiddenNegMsgs = V.map (\i -> scalarNeg (msgs V.! i)) hidden
+      witness = V.fromList [negE, r2, r3] V.++ hiddenNegMsgs
 
-  proofBytes <- prove sponge' (newSchnorrProof relation) hiddenMsgs
+      relation = buildBBSCombinedRelation aPrime bBar aBar h1 hs hidden
+                   pseudonym scope prfKeyIdx
+      sponge'  = absorbPseudonymPresentation @g
+                   sponge hs aPrime bBar disclosed pseudonym scope
+
+  proofBytes <- prove sponge' (newSchnorrProof relation) witness
   pure PseudonymPresentation
-    { ppU         = rU
-    , ppUPrime    = rUPrime
-    , ppUBases    = rUBases
+    { ppAPrime    = aPrime
+    , ppBBar      = bBar
     , ppDisclosed = disclosed
     , ppPseudonym = pseudonym
     , ppScope     = scope
@@ -320,162 +332,207 @@ presentWithPseudonym sponge msgs (MAC u uPrime uBases) disclosedIdxs prfKeyIdx s
     }
 
 -- | Verify a credential presentation with a scoped pseudonym.
---
--- In addition to the standard MAC checks, verifies:
---
--- 4. The pseudonym is not the identity.
--- 5. The combined proof binds the pseudonym to the hidden PRF key
---    attribute via the Dodis-Yampolskiy relation.
 verifyPseudonymPresentation :: forall g sponge.
                                ( Group g, DuplexSponge sponge
                                , Unit sponge ~ Word8 )
                             => sponge
+                            -> SystemParams g
                             -> SecretKey g
                             -> Int
                             -> Int
                             -> PseudonymPresentation g
                             -> Either DeserializeError Bool
-verifyPseudonymPresentation sponge (SecretKey sk) numAttrs prfKeyIdx pres =
-  let rU        = ppU pres
-      rUPrime   = ppUPrime pres
-      rUBases   = ppUBases pres
+verifyPseudonymPresentation sponge (SystemParams hs) (SecretKey x)
+                            numAttrs prfKeyIdx pres =
+  let aPrime    = ppAPrime pres
+      bBar      = ppBBar pres
       disclosed = ppDisclosed pres
       pseudonym = ppPseudonym pres
       scope     = ppScope pres
   in
-  if rU == groupIdentity
+  if aPrime == groupIdentity
     then Right False
   else if pseudonym == groupIdentity
     then Right False
-  else if V.length rUBases /= V.length sk
-    then Right False
-  else if not (allBasesMatch rU sk rUBases)
-    then Right False
   else
-    let discSet = V.toList (V.map fst disclosed)
+    let aBar = groupScalarMul aPrime x
+
+        discSet = V.toList (V.map fst disclosed)
         hidden  = V.fromList [i | i <- [0..numAttrs-1], i `notElem` discSet]
-        v = computeV rUPrime rUBases disclosed
-        relation = buildCombinedRelation rUBases v hidden pseudonym scope prfKeyIdx
-        sponge' = absorbPseudonymPresentation @g
-                    sponge rU rUPrime rUBases disclosed pseudonym scope
+
+        h1 = V.foldl' (\acc (i, m_i) -> acc |+| groupScalarMul (hs V.! i) m_i)
+               groupGenerator disclosed
+
+        relation = buildBBSCombinedRelation aPrime bBar aBar h1 hs hidden
+                     pseudonym scope prfKeyIdx
+        sponge'  = absorbPseudonymPresentation @g
+                     sponge hs aPrime bBar disclosed pseudonym scope
     in verify sponge' (newSchnorrProof relation) (ppProof pres)
 
 ------------------------------------------------------------------------
--- Internal: constant-time helpers
+-- Internal: compute B
 ------------------------------------------------------------------------
 
--- | Check that every base matches the secret key, in constant time.
--- Forces all comparisons regardless of earlier results to prevent
--- timing leaks that reveal which key index failed.
-allBasesMatch :: Group g => g -> V.Vector (GroupScalar g) -> V.Vector g -> Bool
-allBasesMatch u sk uBases =
-  V.foldl' (\acc (x_j, u_j) ->
-    let !eq = u_j == groupScalarMul u x_j
-    in acc && eq) True (V.zip sk uBases)
-
-------------------------------------------------------------------------
--- Internal: proof image computation
-------------------------------------------------------------------------
-
--- | Compute the proof image:
--- @V = U' - U_0 - Σ_{(j,m_j) ∈ disclosed} m_j * U_{j+1}@
-computeV :: forall g. Group g
-         => g -> V.Vector g -> V.Vector (Int, GroupScalar g) -> g
-computeV rUPrime rUBases disclosed =
-  rUPrime |-| V.head rUBases |-|
-    V.foldl' (\acc (j, m_j) -> acc |+| groupScalarMul (rUBases V.! (j + 1)) m_j)
-      groupIdentity
-      disclosed
+-- | Compute @B = g + Σ h_i * m_i@.
+computeB :: forall g. Group g => V.Vector g -> V.Vector (GroupScalar g) -> g
+computeB hs msgs =
+  V.ifoldl' (\acc i m_i -> acc |+| groupScalarMul (hs V.! i) m_i)
+    groupGenerator msgs
 
 ------------------------------------------------------------------------
 -- Internal: linear relation builders
 ------------------------------------------------------------------------
 
--- | Build the linear relation for the MAC-only ZK proof:
--- @V = Σ_{i ∈ hidden} m_i * U_{i+1}@
-buildMACRelation :: forall g. Group g
-                 => V.Vector g -> g -> V.Vector Int -> LinearRelation g
-buildMACRelation rUBases v hiddenIndices =
+-- | Build the linear relation for BBS presentation (no pseudonym).
+--
+-- Witness scalars (3 + k): [negE, r2, r3, negM_{h_0}, ..., negM_{h_{k-1}}]
+--
+-- Equation 1: Abar = negE * A' + r2 * Bbar
+-- Equation 2: H_1  = r3 * Bbar + sum_j negM_{h_j} * h_{h_j}
+--
+-- Bbar is shared between both equations.
+buildBBSRelation :: forall g. Group g
+                 => g             -- ^ A'
+                 -> g             -- ^ Bbar
+                 -> g             -- ^ Abar
+                 -> g             -- ^ H_1
+                 -> V.Vector g    -- ^ system generators h_i
+                 -> V.Vector Int  -- ^ hidden attribute indices
+                 -> LinearRelation g
+buildBBSRelation aPrime bBar aBar h1 hs hidden =
   buildLinearRelation_ $ do
-    let n = V.length hiddenIndices
-    scalarIds <- allocateScalars n
-    elemIds   <- allocateElements (n + 1)
-    let basisIds = V.take n elemIds
-        imageId  = elemIds V.! n
+    let k = V.length hidden
+
+    -- Witness scalars: negE, r2, r3, negM_{h_0}, ..., negM_{h_{k-1}}
+    scalarIds <- allocateScalars (3 + k)
+    let negEId  = scalarIds V.! 0
+        r2Id    = scalarIds V.! 1
+        r3Id    = scalarIds V.! 2
+        negMIds = V.drop 3 scalarIds
+
+    -- Elements for Eq 1: A', Bbar (shared), Abar (image)
+    eq1ElemIds <- allocateElements 3
+    let aPrimeElemId = eq1ElemIds V.! 0
+        bBarElemId   = eq1ElemIds V.! 1
+        aBarElemId   = eq1ElemIds V.! 2
+
+    -- Elements for Eq 2: h_{h_0}, ..., h_{h_{k-1}}, H_1 (image)
+    -- Note: Bbar is shared from eq1 (bBarElemId)
+    eq2ElemIds <- allocateElements (k + 1)
+    let hElemIds  = V.take k eq2ElemIds
+        h1ElemId  = eq2ElemIds V.! k
+
+    -- Set element values
+    setElements
+      [ (aPrimeElemId, aPrime)
+      , (bBarElemId, bBar)
+      , (aBarElemId, aBar)
+      ]
     setElements $ V.toList $ V.imap
-      (\idx i -> (basisIds V.! idx, rUBases V.! (i + 1))) hiddenIndices
-    setElements [(imageId, v)]
-    appendEquation imageId
-      (V.toList $ V.zip scalarIds basisIds)
+      (\j hIdx -> (hElemIds V.! j, hs V.! hIdx)) hidden
+    setElements [(h1ElemId, h1)]
 
--- | Build a combined linear relation for MAC + Dodis-Yampolskiy PRF:
+    -- Eq 1: Abar = negE * A' + r2 * Bbar
+    appendEquation aBarElemId
+      [ (negEId, aPrimeElemId)
+      , (r2Id,   bBarElemId)
+      ]
+
+    -- Eq 2: H_1 = r3 * Bbar + sum_j negM_{h_j} * h_{h_j}
+    appendEquation h1ElemId $
+      (r3Id, bBarElemId) :
+      V.toList (V.imap (\j _ -> (negMIds V.! j, hElemIds V.! j)) hidden)
+
+-- | Build the combined linear relation for BBS + Dodis-Yampolskiy PRF.
 --
--- Equation 1 (MAC):  @V = Σ_{i ∈ hidden} m_i * U_{i+1}@
--- Equation 2 (PRF):  @Q = k * P@  where @Q = G - scope * P@
---
--- Both equations share the scalar variable for the PRF key @k@,
--- binding the pseudonym to the credential.
-buildCombinedRelation :: forall g. Group g
-                      => V.Vector g
-                      -> g
-                      -> V.Vector Int
-                      -> g
-                      -> GroupScalar g
-                      -> Int
-                      -> LinearRelation g
-buildCombinedRelation rUBases v hiddenIndices pseudonym scope prfKeyIdx =
+-- Same as 'buildBBSRelation' plus one extra equation:
+--   Q = negM_{prfKeyPos} * (-P)
+-- where Q = G - scope * P, sharing the negM scalar with Eq 2.
+buildBBSCombinedRelation :: forall g. Group g
+                         => g -> g -> g -> g -> V.Vector g -> V.Vector Int
+                         -> g -> GroupScalar g -> Int
+                         -> LinearRelation g
+buildBBSCombinedRelation aPrime bBar aBar h1 hs hidden
+                         pseudonym scope prfKeyIdx =
   buildLinearRelation_ $ do
-    let n = V.length hiddenIndices
-    scalarIds <- allocateScalars n
+    let k = V.length hidden
 
-    -- MAC elements: n bases + 1 image
-    macElemIds <- allocateElements (n + 1)
-    let macBasisIds = V.take n macElemIds
-        macImageId  = macElemIds V.! n
+    -- Witness scalars: negE, r2, r3, negM_{h_0}, ..., negM_{h_{k-1}}
+    scalarIds <- allocateScalars (3 + k)
+    let negEId  = scalarIds V.! 0
+        r2Id    = scalarIds V.! 1
+        r3Id    = scalarIds V.! 2
+        negMIds = V.drop 3 scalarIds
 
-    -- PRF elements: 1 base (P) + 1 image (Q)
+    -- Elements for Eq 1: A', Bbar (shared), Abar (image)
+    eq1ElemIds <- allocateElements 3
+    let aPrimeElemId = eq1ElemIds V.! 0
+        bBarElemId   = eq1ElemIds V.! 1
+        aBarElemId   = eq1ElemIds V.! 2
+
+    -- Elements for Eq 2: h_{h_0}, ..., h_{h_{k-1}}, H_1 (image)
+    eq2ElemIds <- allocateElements (k + 1)
+    let hElemIds  = V.take k eq2ElemIds
+        h1ElemId  = eq2ElemIds V.! k
+
+    -- PRF elements: (-P), Q
     prfElemIds <- allocateElements 2
-    let prfBasisId = prfElemIds V.! 0
-        prfImageId = prfElemIds V.! 1
+    let negPElemId = prfElemIds V.! 0
+        qElemId    = prfElemIds V.! 1
 
-    -- Set MAC basis elements: U_{i+1} for each hidden attribute i
+    -- Set element values
+    setElements
+      [ (aPrimeElemId, aPrime)
+      , (bBarElemId, bBar)
+      , (aBarElemId, aBar)
+      ]
     setElements $ V.toList $ V.imap
-      (\idx i -> (macBasisIds V.! idx, rUBases V.! (i + 1))) hiddenIndices
-    setElements [(macImageId, v)]
+      (\j hIdx -> (hElemIds V.! j, hs V.! hIdx)) hidden
+    setElements [(h1ElemId, h1)]
 
-    -- Set PRF elements: P (pseudonym) and Q = G - scope * P
     let q = groupGenerator |-| (pseudonym |*| scope)
-    setElements [(prfBasisId, pseudonym), (prfImageId, q)]
+    setElements [(negPElemId, groupNeg pseudonym), (qElemId, q)]
 
-    -- MAC equation: V = Σ_{i∈H} m_i * U_{i+1}
-    appendEquation macImageId
-      (V.toList $ V.zip scalarIds macBasisIds)
+    -- Eq 1: Abar = negE * A' + r2 * Bbar
+    appendEquation aBarElemId
+      [ (negEId, aPrimeElemId)
+      , (r2Id,   bBarElemId)
+      ]
 
-    -- PRF equation: Q = k * P
-    -- k's scalar variable is at the position of prfKeyIdx in hiddenIndices
-    let kPos = case V.findIndex (== prfKeyIdx) hiddenIndices of
-                 Just p  -> p
-                 Nothing -> error
-                   "presentWithPseudonym: PRF key index must be hidden"
-    appendEquation prfImageId [(scalarIds V.! kPos, prfBasisId)]
+    -- Eq 2: H_1 = r3 * Bbar + sum_j negM_{h_j} * h_{h_j}
+    appendEquation h1ElemId $
+      (r3Id, bBarElemId) :
+      V.toList (V.imap (\j _ -> (negMIds V.! j, hElemIds V.! j)) hidden)
+
+    -- Eq 3 (PRF): Q = negM_{prfKeyPos} * (-P)
+    -- Since witness has negM_j = -m_j, and at prfKeyPos we have -k,
+    -- this gives Q = (-k) * (-P) = k * P, which is correct.
+    let prfKeyPos = case V.findIndex (== prfKeyIdx) hidden of
+                      Just p  -> p
+                      Nothing -> error
+                        "presentWithPseudonym: PRF key index must be hidden"
+    appendEquation qElemId [(negMIds V.! prfKeyPos, negPElemId)]
 
 ------------------------------------------------------------------------
 -- Internal: Fiat-Shamir sponge absorption
 ------------------------------------------------------------------------
 
--- | Absorb presentation context into a Fiat-Shamir sponge for domain
--- separation: U, U', all U_j bases, and sorted disclosed (index, message)
--- pairs.
+-- | Absorb presentation context into a Fiat-Shamir sponge:
+-- system params (all h_i), A', Bbar, then length-prefixed sorted
+-- disclosed pairs.
 absorbPresentation :: forall g sponge.
-                      (Group g, DuplexSponge sponge, Unit sponge ~ Word8)
-                   => sponge -> g -> g -> V.Vector g
-                   -> V.Vector (Int, GroupScalar g) -> sponge
-absorbPresentation s0 rU rUPrime rUBases disclosed =
-  let s1 = absorbDuplexSponge s0 (BS.unpack $ serializeElement rU)
-      s2 = absorbDuplexSponge s1 (BS.unpack $ serializeElement rUPrime)
-      s3 = V.foldl'
-             (\s b -> absorbDuplexSponge s (BS.unpack $ serializeElement b))
-             s2 rUBases
+                       (Group g, DuplexSponge sponge, Unit sponge ~ Word8)
+                    => sponge -> V.Vector g -> g -> g
+                    -> V.Vector (Int, GroupScalar g) -> sponge
+absorbPresentation s0 hs aPrime bBar disclosed =
+  let -- Absorb system params
+      s1 = V.foldl'
+             (\s h -> absorbDuplexSponge s (BS.unpack $ serializeElement h))
+             s0 hs
+      -- Absorb A' and Bbar
+      s2 = absorbDuplexSponge s1 (BS.unpack $ serializeElement aPrime)
+      s3 = absorbDuplexSponge s2 (BS.unpack $ serializeElement bBar)
+      -- Absorb disclosed pairs
       sorted = sortBy (comparing fst) (V.toList disclosed)
       s4 = absorbDuplexSponge s3 (BS.unpack $ i2osp 4 (length sorted))
       s5 = foldl
@@ -489,13 +546,13 @@ absorbPresentation s0 rU rUPrime rUBases disclosed =
 -- | Absorb pseudonym presentation context: the base presentation context
 -- plus the pseudonym point and scope scalar.
 absorbPseudonymPresentation :: forall g sponge.
-                               ( Group g, DuplexSponge sponge
-                               , Unit sponge ~ Word8 )
-                            => sponge -> g -> g -> V.Vector g
-                            -> V.Vector (Int, GroupScalar g)
-                            -> g -> GroupScalar g -> sponge
-absorbPseudonymPresentation s0 rU rUPrime rUBases disclosed pseudonym scope =
-  let s1 = absorbPresentation @g s0 rU rUPrime rUBases disclosed
+                                ( Group g, DuplexSponge sponge
+                                , Unit sponge ~ Word8 )
+                             => sponge -> V.Vector g -> g -> g
+                             -> V.Vector (Int, GroupScalar g)
+                             -> g -> GroupScalar g -> sponge
+absorbPseudonymPresentation s0 hs aPrime bBar disclosed pseudonym scope =
+  let s1 = absorbPresentation @g s0 hs aPrime bBar disclosed
       s2 = absorbDuplexSponge s1 (BS.unpack $ serializeElement pseudonym)
       s3 = absorbDuplexSponge s2 (BS.unpack $ serializeScalar scope)
   in s3
