@@ -3,4 +3,4 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/SamuelSchlesinger/sigma-hs
-  tag: deee0049b9af052183c720c3c06d0530edfc2baf
+  tag: 121ce2cc971cbe5fae1cdf48c51a158291598ad0
